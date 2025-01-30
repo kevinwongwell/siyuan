@@ -1,0 +1,39 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]  # 触发分支名（如 main 或 master）
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:    # 允许手动触发
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        go-version: [1.20.x]  # Go 版本需与思源笔记要求一致
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Build Kernel
+        run: |
+          cd kernel
+          go build -o siyuan
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: siyuan-${{ matrix.os }}
+          path: |
+            kernel/siyuan
+            README.md
+          if-no-files-found: error
