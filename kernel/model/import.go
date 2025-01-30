@@ -17,6 +17,8 @@
 package model
 
 import (
+   sqlite "database/sql" //魔改：导入原始sqlite3包
+_ "github.com/mattn/go-sqlite3" // 魔改：导入原始sqlite3包
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -1459,3 +1461,638 @@ func searchLinkID(link string) (id string) {
 	}
 	return
 }
+
+
+// 魔改：新增函数从为知笔记数据文件夹导入
+func ImportFromWiz(boxID, localPath, baseHPath, baseTargetPath string) (err error) {
+	wizdbPath := filepath.Join(localPath, "index.db")
+	wizdb, err := sqlite.Open("sqlite3", wizdbPath)
+	if err != nil {
+		return nil
+	}
+	defer wizdb.Close()
+	// 注意NULL值与任何值做任何比较，结果都是fasle，过滤条件须添加 `DOCUMENT_TYPE IS NULL`
+	wizrows_count, err := wizdb.Query("SELECT COUNT(*) FROM WIZ_DOCUMENT WHERE (DOCUMENT_TYPE != 'collaboration' OR DOCUMENT_TYPE IS NULL) AND DOCUMENT_PROTECT = 0")
+	if err != nil {
+		return nil
+	}
+	wizrows_count.Next()
+	wizCount := 0
+	wizColumn := 0
+	err = wizrows_count.Scan(&wizCount)
+	wizrows_count.Close()
+	if err != nil {
+		return nil
+	}
+	wizrows, err := wizdb.Query("SELECT DOCUMENT_GUID, DOCUMENT_TITLE, DOCUMENT_LOCATION, DOCUMENT_NAME, DOCUMENT_URL, DOCUMENT_TYPE, DOCUMENT_FILE_TYPE, DT_CREATED, DT_MODIFIED, DT_ACCESSED, DOCUMENT_ATTACHEMENT_COUNT FROM WIZ_DOCUMENT WHERE (DOCUMENT_TYPE != 'collaboration' OR DOCUMENT_TYPE IS NULL) AND DOCUMENT_PROTECT = 0 ORDER BY DT_CREATED ASC")
+	if err != nil {
+		logging.LogErrorf("查询为知数据库失败：%s", err)
+		return nil
+	}
+	defer wizrows.Close()
+	util.PushEndlessProgress("检测到为知笔记数据库，正在尝试导入笔记……")
+
+	var markdownStr string
+	var tree *parse.Tree
+
+	var DocumentGuid string         // GUID
+	var DocumentTitle string        // 标题
+	var DocumentLocation string     // 路径
+	var DocumentName string         // 文件名
+	var DocumentUrl *string         // 如果不为空则是剪藏的笔记，剪藏的url
+	var DocumentType *string        // 类型，除了经典版不存储的值为collaboration的md笔记，lite/markdown为html和md混合排版笔记，其它默认为html笔记
+	var DocumentFileType *string    // 如果不为空则是导入的笔记，被导入文件类型
+	var DtCreated string            // 创建时间
+	var DtModified string           // 修改时间
+	var DtAccessed string           // 访问时间
+	var DocumentAttachmentCount int // 附件数
+
+	targetPaths := map[string]string{}
+	tmpPath := os.Getenv("LOCALAPPDATA")
+	if tmpPath == "" {
+		return errors.New("获取系统应用程序数据文件夹路径失败！")
+	}
+	tmpPath = filepath.Join(tmpPath, "Temp")
+	unzipPath := filepath.Join(tmpPath, "wizunzip")
+	luaPath := filepath.Join(util.TempDir, "pandoc_script.lua")
+	// 生成pandoc过滤器lua脚本，如果存在，则不创建
+	if !gulu.File.IsExist(luaPath) {
+		luaString := `
+-- 定义一个函数，用于检查样式并转换为对应的Markdown标记
+local function convert_style (elem)
+  if #elem.content == 0 then
+    return {}
+  end
+  -- 检查 elem.attributes 是否存在
+  if not elem.attributes then
+    return elem.content
+  end
+  -- 获取样式属性
+  local style = elem.attributes.style
+  if not style then
+    return elem.content
+  end
+  -- 下划线样式，将内容用<u>包围，排除超链接
+  if (string.find(style, 'text%-decoration%s*:%s*underline') or string.find(style, 'text%-decoration%-style')) and elem.t ~= "Link" then
+    -- 创建 <u> 标签包裹内容
+    local u_open = pandoc.RawInline('gfm', '<u>')
+    local u_close = pandoc.RawInline('gfm', '</u>')
+    -- 插入 <u> 标签到内容的前后
+    table.insert(elem.content, 1, u_open)
+    table.insert(elem.content, u_close)
+  end
+  -- 粗体样式，将内容用**包围
+  if string.find(style, 'font%-weight%s*:%s*bold') then
+    -- 创建字符串节点
+    local s_label = pandoc.RawInline('gfm','**')
+    -- 插入字符串到内容的前后
+    table.insert(elem.content, 1, s_label)
+    table.insert(elem.content, s_label)
+  end
+  -- 斜体样式，将内容用*包围
+  if string.find(style, 'font%-style%s*:%s*italic') then
+    local e_label = pandoc.RawInline('gfm','*')
+    table.insert(elem.content, 1, e_label)
+    table.insert(elem.content, e_label)
+  end
+  -- 删除线样式，将内容用~~包围
+  if string.find(style, 'text%-decoration%s*:%s*line%-through') then
+    local so_label = pandoc.RawInline('gfm','~~')
+    table.insert(elem.content, 1, so_label)
+    table.insert(elem.content, so_label)
+  end
+  -- 高亮样式，将内容用==包围
+  if string.find(style, 'background%-color:%s*rgb%(255,%s*255,%s*0%)') then
+    local m_label = pandoc.RawInline('gfm','==')
+    table.insert(elem.content, 1, m_label)
+    table.insert(elem.content, m_label)
+  end
+  return elem.content
+end
+
+-- 不带"+raw_html"情况下提取为知笔记代码块
+function Div(elem)
+  -- 仅处理 class="wiz-code-container" <div>
+  if elem.classes[1] == "wiz-code-container" then
+    local code_lang = elem.attributes.mode
+	local code_content = ""
+	elem.content = elem.content[1].content[6].content[1].content[1].content[1].content[1].content[5].content
+	for i, code in ipairs(elem.content) do
+	  if not code.content[4] then
+	    code_content = code_content..code.content[2].text.."\n"
+	  else
+	    code_content = code_content..code.content[4].text.."\n"
+	  end
+	end
+	return pandoc.CodeBlock(code_content, { class = code_lang })
+  else return pandoc.Div(convert_style(elem))
+  end
+end
+
+-- <br>标签转换为自然换行
+function LineBreak(elem)
+  return pandoc.Str("\n")
+end
+
+-- 处理<u>标签，跳过pandoc带-raw_html参数时转换
+function Underline(elem)
+  if #elem.content == 0 then
+    return {}
+  end
+  local u_open = pandoc.RawInline('gfm','<u>')
+  local u_close = pandoc.RawInline('gfm','</u>')
+  table.insert(elem.content, 1, u_open)
+  table.insert(elem.content, u_close)
+  return elem.content
+end
+-- <sup>上标
+function Superscript(elem)
+  if #elem.content == 0 then
+    return {}
+  end
+  local sup_label = pandoc.RawInline('gfm','^')
+  table.insert(elem.content, 1, sup_label)
+  table.insert(elem.content, sup_label)
+  return elem.content
+end
+-- <sub>下标
+function Subscript(elem)
+  if #elem.content == 0 then
+    return {}
+  end
+  local sub_label = pandoc.RawInline('gfm','~')
+  table.insert(elem.content, 1, sub_label)
+  table.insert(elem.content, sub_label)
+  return elem.content
+end
+-- <kbd>处理流程在<span>标签中
+-- 处理<SPAN>标签
+function Span(elem)
+  -- 处理<kbd>标签
+  if elem.classes[1] == "kbd" and #elem.content ~= 0 then
+    local k_open = pandoc.RawInline('gfm','<kbd>')
+    local k_close = pandoc.RawInline('gfm','</kbd>')
+	table.insert(elem.content, 1, k_open)
+    table.insert(elem.content, k_close)
+	return elem.content
+  else
+    -- 转换<span>的style样式为markdown标签
+    return pandoc.Span(convert_style(elem))
+  end
+end
+-- 处理<a>标签
+function Link(elem)
+  -- 删除空链接或空字符的超链接
+  if elem.target == "" or #elem.content == 0 then
+    -- 返回空字符串，删除整个<a>标签
+    return {}
+  -- 页内导航直接返回文本
+  elseif elem.target:match('^#') then
+    return convert_style(elem)
+  end
+  return pandoc.Link(convert_style(elem),elem.target,elem.title)
+end
+-- 处理<h>标签样式
+function Header(elem)
+  if #elem.content == 0 then
+    return {}
+  end
+  return pandoc.Header(elem.level,convert_style(elem))
+end
+
+-- 处理base64编码内容
+-- 识别mimetype，并转换为扩展名
+local mimetypes = {
+  ["image/jpeg"] = "jpg",
+  ["image/png"] = "png",
+  ["image/gif"] = "gif",
+  ["image/svg+xml"] = "svg",
+  ["audio/mpeg"] = "mp3",
+  ["audio/ogg"] = "ogg",
+  ["video/mp4"] = "mp4",
+  ["application/pdf"] = "pdf",
+}
+-- 计算字符串hash值
+function djb2_hash(str)
+  local hash = 7
+  for i = 1, #str do
+      hash = hash * 3 + string.byte(str, i)
+  end
+  return hash
+end
+-- 解码base64
+local function decode_base64(input)
+  local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  input = string.gsub(input, '[^'..b..'=]', '')
+  return (input:gsub('.', function(x)
+    if (x == '=') then return '' end
+    local r, f = '', (b:find(x) - 1)
+    for i = 6, 1, -1 do
+      r = r .. (f % 2 ^ i - f % 2 ^ (i - 1) > 0 and '1' or '0')
+    end
+    return r
+  end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
+    if (#x ~= 8) then return '' end
+    local c = 0
+    for i = 1, 8 do c = c + (x:sub(i, i) == '1' and 2 ^ (8 - i) or 0) end
+    return string.char(c)
+  end))
+end
+-- 生成文件和链接
+local function extract_base64(elem)
+  local src = elem.src
+  local mime_type, base64_data = src:match('^data:(.-);base64,(.+)')
+  -- 清除为知笔记像素点
+  if base64_data == 'R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==' then
+    return {}
+  end
+  local ext = mimetypes[mime_type] or 'bin'
+  local file_name = string.format("%08x", djb2_hash(base64_data)) .. '.' .. ext
+  local file_path = os.getenv('LOCALAPPDATA').."\\Temp\\wizunzip\\"..file_name
+  -- 如果file_path不存在，则创建文件
+  local file = io.open(file_path, 'r')
+  if not file then
+    local decoded_data = decode_base64(base64_data)
+    if ext == "svg" and not string.find(decoded_data, 'xmlns="http://www.w3.org') then
+      decoded_data = decoded_data:gsub('<svg', '<svg xmlns="http://www.w3.org/2000/svg"')
+    end
+    -- 创建decode后的二进制文件
+    file = io.open(file_path, 'wb')
+    file:write(decoded_data)
+    file:close()
+  else
+    io.close(file)
+  end
+  -- 生成markdown链接
+  return pandoc.Image(elem.caption,file_name,elem.title)
+end
+-- 处理<img><svg>等标签
+function Image(elem)
+  if elem.src == "" then
+    return {}
+  -- 提取base64图片，思源无法识别gif和svg，此处预处理所有base64图像
+  elseif elem.src:match('^data:') then
+    return extract_base64(elem)
+  end
+end
+-- 处理<pre>标签
+function CodeBlock(elem)
+  if #elem.classes == 0 then
+    elem.classes = {"plaintext"}
+  -- 如果elem.classes[1]的值是hljs，则是hljs样式，返回elem.classes[2]的值
+  elseif elem.classes[1] == "hljs" then
+    elem.classes = {elem.classes[2]}
+  -- 如果elem.classes的值以brush:开头，则返回elem.classes的值为brush:后的值
+  elseif elem.classes[1]:match('^brush:') then
+    elem.classes = {elem.classes[1]:match('^brush:(.+)')}
+  -- 如果elem.classes的值以language-开头，则返回elem.classes的值为language-后的值
+  elseif elem.classes[1]:match('^language-') then
+    elem.classes = {elem.classes[1]:match('^language-(.+)')}
+  end
+  return elem
+end
+-- 处理纯附件导入笔记的表格
+function Table(elem)
+  if elem.bodies[1].body[1].cells[1].contents[1].t == "Header" then
+   local cell = pandoc.Plain(elem.bodies[1].body[1].cells[1].contents[1].content[1])
+   elem.bodies[1].body[1].cells[1].contents[1] = cell
+   return elem
+  end
+end
+`
+		if os.WriteFile(luaPath, []byte(luaString), 0755) != nil {
+			msg := fmt.Sprintf("创建pandoc过滤器lua文件失败：%s", err)
+			logging.LogErrorf(msg)
+			return errors.New(msg)
+		}
+		defer os.RemoveAll(luaPath)
+	}
+
+	targetPaths["/"] = baseTargetPath
+	succeed := 0
+	failed := 0
+	incomplete := 0
+
+	for wizrows.Next() {
+		// 清理资源
+		os.RemoveAll(unzipPath)
+		importTrees = []*parse.Tree{}
+		searchLinks = map[string]string{}
+
+		err = wizrows.Scan(&DocumentGuid, &DocumentTitle, &DocumentLocation, &DocumentName, &DocumentUrl, &DocumentType, &DocumentFileType, &DtCreated, &DtModified, &DtAccessed, &DocumentAttachmentCount)
+		if err != nil {
+			msg := fmt.Sprintf("读取为知数据库失败：%s", err)
+			logging.LogErrorf(msg)
+			return errors.New(msg)
+		}
+		// 构造targetPaths哈希表，键为文件夹的相对路径，值为思源笔记树形结构中的绝对路径 & 创建文件夹
+		DocumentLocation = path.Dir(DocumentLocation)
+		targetPath := ""
+		if targetPaths[DocumentLocation] == "" {
+			importTrees = []*parse.Tree{}
+			// 生成当前文档父级路径
+			DocumentPath := DocumentLocation
+			for targetPaths[DocumentPath] == "" {
+				targetPath = path.Join(wizDate(DtCreated)+"-"+randStr(7), targetPath)
+				DocumentPath = path.Dir(DocumentPath)
+			}
+			targetPath = path.Join(strings.TrimSuffix(targetPaths[DocumentPath], ".sy"), targetPath)
+			// 递归生成每级父级路径
+			DocumentPath = DocumentLocation
+			for targetPaths[DocumentPath] == "" {
+				targetPaths[DocumentPath] = targetPath + ".sy"
+				// 构造文件夹树
+				tree = treenode.NewTree(boxID, targetPaths[DocumentPath], path.Join(baseHPath, DocumentPath), path.Base(DocumentPath))
+				importTrees = append(importTrees, tree)
+
+				DocumentPath = path.Dir(DocumentPath)
+				targetPath = path.Dir(targetPath)
+			}
+		}
+
+		wizColumn += 1
+		wizNote := path.Join(DocumentLocation, DocumentTitle)
+		util.PushEndlessProgress(fmt.Sprintf("正在导入为知笔记[%d/%d]，成功[%d]失败[%d]：%s", wizColumn, wizCount, succeed, failed, wizNote))
+
+		// 解压单篇为知笔记文件
+		wizDocument := filepath.Join(localPath, DocumentLocation, DocumentName)
+		err = gulu.Zip.Unzip(wizDocument, unzipPath)
+		if nil != err {
+			logging.LogErrorf("解压笔记[%s]错误：%s", wizNote, err)
+			failed += 1
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(unzipPath, "index.html"))
+		if nil != err {
+			logging.LogErrorf("读取笔记[%s]html文件失败： %s", wizNote, err)
+			failed += 1
+			continue
+		}
+		// 将data转换为utf8编码
+		data, err = io.ReadAll(transform.NewReader(bytes.NewReader(data), unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewDecoder()))
+		if err != nil {
+			logging.LogErrorf("解码笔记[%s]失败：%s", wizNote, err)
+			failed += 1
+			continue
+		}
+
+		// 根据笔记类型DocumentType值按条件处理笔记内容
+		if DocumentType != nil && *DocumentType == "lite/markdown" {
+			markdown := regexp.MustCompile(`(?i)(?s)<pre>(.*?)</pre>`).FindStringSubmatch(string(data))
+			if len(markdown) > 1 {
+				markdownStr = markdown[1]
+			}
+		} else {
+			args := []string{
+				"-f", "html+tex_math_dollars",
+				"-t", "gfm-raw_html",
+				"-L", luaPath,
+				/*"-o", markdownPath, // 注释此行输出到标准输出*/
+				"--wrap=none"}
+			pandoc := exec.Command(Conf.Export.PandocBin, args...)
+			gulu.CmdAttr(pandoc)
+			pandoc.Stdin = bytes.NewBuffer(data)
+			output, err := pandoc.Output()
+			if nil != err {
+				logging.LogErrorf("转换笔记[%s]格式失败:%s", wizNote, err)
+				failed += 1
+				continue
+			}
+			markdownStr = string(output)
+		}
+		markdownStr = strings.TrimSpace(markdownStr)
+		// 修改带附件笔记
+		if DocumentAttachmentCount > 0 {
+			attachmentDir := strings.Replace(DocumentName, ".ziw", "_Attachments", 1)
+			err = gulu.File.CopyDir(filepath.Join(localPath, DocumentLocation, attachmentDir), filepath.Join(unzipPath, attachmentDir))
+			if err != nil {
+				logging.LogErrorf("复制笔记[%s]附件失败：%s", wizNote, err)
+				incomplete = 1
+			}
+			// 处理插入文档的附件
+			attachmentSrc := `wiz://open_attachment\?guid=[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`
+			SrcIndex := []int{0, 0}
+			attachmentName := ""
+			for {
+				SrcIndex := regexp.MustCompile(attachmentSrc).FindStringIndex(markdownStr[SrcIndex[1]:])
+				if SrcIndex == nil {
+					break
+				}
+				guid := markdownStr[SrcIndex[0]+len("wiz://open_attachment?guid=") : SrcIndex[1]]
+				attachmentRow, err := wizdb.Query("SELECT ATTACHMENT_NAME FROM WIZ_DOCUMENT_ATTACHMENT WHERE ATTACHMENT_GUID = ?", guid)
+				if err != nil {
+					logging.LogErrorf("查询笔记[%s]附件名称失败：%s", wizNote, err)
+					incomplete = 1
+				} else {
+					if attachmentRow.Next() {
+						err = attachmentRow.Scan(&attachmentName)
+						if err != nil {
+							logging.LogErrorf("读取笔记[%s]附件名称失败：%s", wizNote, err)
+							incomplete = 1
+						} else {
+							attachmentSrc := filepath.Join(attachmentDir, attachmentName)
+							markdownStr = markdownStr[:SrcIndex[0]] + attachmentSrc + markdownStr[SrcIndex[1]:]
+						}
+					}
+					attachmentRow.Close()
+				}
+			}
+			// 将附件附在笔记最后
+			attachments, err := os.ReadDir(filepath.Join(unzipPath, attachmentDir))
+			if err != nil {
+				logging.LogErrorf("读取笔记[%s]附件文件夹失败：%s", wizNote, err)
+				incomplete = 1
+			} else {
+				if len(attachments) > 0 {
+					markdownStr = markdownStr + "\n---\n" + "# 附件：\n"
+					for _, attachment := range attachments {
+						markdownStr = markdownStr + "[" + attachment.Name() + "]" + "(" + path.Join(attachmentDir, attachment.Name()) + ")\n"
+					}
+					markdownStr = markdownStr + "---"
+				}
+			}
+		}
+		// 处理带tag的笔记
+		var tagName string
+		var tag string
+		tagRow, err := wizdb.Query("SELECT t2.TAG_NAME FROM WIZ_DOCUMENT_TAG AS t1 JOIN WIZ_TAG AS t2 ON t1.TAG_GUID = t2.TAG_GUID WHERE DOCUMENT_GUID = ?", DocumentGuid)
+		if err != nil {
+			logging.LogErrorf("查询笔记[%s]tag失败：%s", wizNote, err)
+			incomplete = 1
+		} else {
+			for tagRow.Next() {
+				err = tagRow.Scan(&tagName)
+				if err != nil {
+					logging.LogErrorf("读取笔记[%s]tag信息失败： %s", wizNote, err)
+					incomplete = 1
+				}
+				if tagName != "" {
+					tag = tag + "#" + tagName + "#" + " "
+				}
+			}
+			tagRow.Close()
+		}
+		if tag != "" {
+			markdownStr = "---\n标签：" + tag + "\n---\n" + markdownStr
+		}
+		// 修改剪藏笔记，如果DocumentUrl指向的值以http开头，则在笔记前添加剪藏信息
+		if DocumentUrl != nil && strings.HasPrefix(*DocumentUrl, "http") {
+			clipInfo := fmt.Sprintf("---\n\n* 使用为知笔记剪藏自：\n* [%s](%s)\n* %s\n\n---\n", *DocumentUrl, *DocumentUrl, DtCreated)
+			markdownStr = clipInfo + markdownStr
+		}
+		// 创建语法树
+		tree := parseStdMd([]byte(markdownStr))
+		if nil == tree {
+			logging.LogErrorf("解析笔记[%s]MD文件失败：%s", wizNote, err)
+			failed += 1
+			continue
+		}
+		id := wizDate(DtCreated) + "-" + randStr(7)
+		targetPath = strings.ReplaceAll((path.Join(targetPaths[DocumentLocation], id+".sy")), ".sy/", "/")
+		tree.ID = id
+		tree.Root.ID = id
+		tree.Root.SetIALAttr("id", tree.Root.ID)
+		tree.Root.SetIALAttr("title", DocumentTitle)
+		tree.Root.SetIALAttr("updated", wizDate(DtModified))
+		tree.Box = boxID
+		tree.Path = targetPath
+		tree.HPath = path.Join(baseHPath, DocumentLocation, DocumentTitle)
+		tree.Root.Spec = "1"
+
+		boxLocalPath := filepath.Join(util.DataDir, boxID)
+		docDirLocalPath := filepath.Dir(filepath.Join(boxLocalPath, targetPath))
+		assetDirPath := getAssetsDir(boxLocalPath, docDirLocalPath)
+		assetName := map[string]string{}
+		ast.Walk(tree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
+			if !entering || (ast.NodeLinkDest != n.Type && !n.IsTextMarkType("a")) {
+				return ast.WalkContinue
+			}
+
+			var dest string
+			if ast.NodeLinkDest == n.Type {
+				dest = n.TokensStr()
+			} else {
+				dest = n.TextMarkAHref
+			}
+
+			if strings.HasPrefix(dest, "data:image") && strings.Contains(dest, ";base64,") {
+				processBase64Img(n, dest, assetDirPath, err)
+				return ast.WalkContinue
+			}
+
+			dest = strings.ReplaceAll(dest, "%20", " ")
+			dest = strings.ReplaceAll(dest, "%5C", "/")
+			if ast.NodeLinkDest == n.Type {
+				n.Tokens = []byte(dest)
+			} else {
+				n.TextMarkAHref = dest
+			}
+			if !util.IsRelativePath(dest) {
+				return ast.WalkContinue
+			}
+			dest = filepath.ToSlash(dest)
+			if dest == "" {
+				return ast.WalkContinue
+			}
+
+			absolutePath := filepath.Join(unzipPath, dest)
+			exist := gulu.File.IsExist(absolutePath)
+			if !exist {
+				absolutePath = filepath.Join(unzipPath, string(html.DecodeDestination([]byte(dest))))
+				exist = gulu.File.IsExist(absolutePath)
+			}
+			if exist {
+				// 去重复制
+				var name string
+				if assetName[absolutePath] == "" {
+					name = filepath.Base(absolutePath)
+					name = util.AssetName(name)
+					assetName[absolutePath] = name
+					assetTargetPath := filepath.Join(assetDirPath, name)
+					if err = filelock.Copy(absolutePath, assetTargetPath); nil != err {
+						logging.LogErrorf("复制笔记[%s]资源文件失败:%s", wizNote, err)
+						return ast.WalkContinue
+					}
+				} else {
+					name = assetName[absolutePath]
+				}
+				if ast.NodeLinkDest == n.Type {
+					n.Tokens = []byte("assets/" + name)
+				} else {
+					n.TextMarkAHref = "assets/" + name
+				}
+			}
+			return ast.WalkContinue
+		})
+
+		importTrees = append(importTrees, tree)
+		// 写入笔记
+		if 0 < len(importTrees) {
+			initSearchLinks()
+			convertWikiLinksAndTags()
+			buildBlockRefInText()
+			for _, tree := range importTrees {
+				err = indexWriteTreeIndexQueue(tree)
+				if nil != err {
+					logging.LogErrorf("写入笔记[%s]文件失败：%s", wizNote, err)
+					failed += 1
+					continue
+				}
+			}
+		}
+		succeed += 1
+		failed += incomplete
+		// 清理资源
+		os.RemoveAll(unzipPath)
+		importTrees = []*parse.Tree{}
+		searchLinks = map[string]string{}
+	}
+	if gulu.File.IsExist(unzipPath) {
+		os.RemoveAll(unzipPath)
+	}
+	IncSync()
+	debug.FreeOSMemory()
+	if failed == 0 {
+		util.PushMsg(fmt.Sprintf("成功导入所有有效为知笔记，共%d条。", succeed), 15000)
+	} else {
+		return fmt.Errorf("成功导入有效为知笔记%d条，失败%d条,详情请查看日志。", succeed, failed)
+	}
+	return nil
+}
+
+
+
+// 魔改，转换为知笔记中的时间变量
+func wizDate(wiz_time string) string {
+	t, err := time.Parse("2006-01-02 15:04:05", wiz_time)
+	if err == nil {
+		return t.Format("20060102150405")
+	} else {
+		return time.Now().Format("20060102150405")
+	}
+}
+
+
+
+	var baseHPath, baseTargetPath, boxLocalPath string
+	if "/" == toPath {
+		baseHPath = "/"
+		baseTargetPath = "/"
+	} else {
+		block := treenode.GetBlockTreeRootByPath(boxID, toPath)
+		if nil == block {
+			logging.LogErrorf("not found block by path [%s]", toPath)
+			return nil
+		}
+		baseHPath = block.HPath
+		baseTargetPath = strings.TrimSuffix(block.Path, ".sy")
+	}
+	boxLocalPath = filepath.Join(util.DataDir, boxID)
+
+
+
+	// 魔改：导入为知笔记
+	err = ImportFromWiz(boxID, localPath, baseHPath, baseTargetPath)
+	if nil != err {
+		return err
+	}
